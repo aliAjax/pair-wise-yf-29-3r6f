@@ -1,4 +1,16 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>法律证据保管</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,input,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>法律证据保管与流转</h1><div class="panel"><select id="user"><option>custodian1</option><option>custodian2</option><option>analyst1</option><option>auditor1</option><option>outsider</option></select><input id="case" value="1"><button onclick="load()">生成保管报告</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch(`/api/cases/${case.value}/report`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,input,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin-bottom:16px}.row{display:flex;flex-wrap:wrap;align-items:center}</style></head>
+<body><h1>法律证据保管与流转</h1>
+<div class="panel"><div class="row"><label>身份 <select id="user"><option>custodian1</option><option>custodian2</option><option>analyst1</option><option>auditor1</option><option>outsider</option></select></label><label>案件 <input id="case" value="1" size="4"></label><button onclick="load()">生成保管报告</button></div></div>
+
+<div class="panel"><h3>借调单（保管链）</h3>
+<div class="row"><label>证据ID <input id="evid" value="1" size="4"></label><input id="borrower" placeholder="借调接收方" size="14"><input id="purpose" placeholder="借调事由" size="16"><button onclick="loanAct(`/api/evidence/${evid.value}/loans`,{borrower:borrower.value,purpose:purpose.value})">保管员发起借调</button></div>
+<div class="row"><label>借调单ID <input id="loanid" value="1" size="4"></label><button onclick="loanAct(`/api/loans/${loanid.value}/approve`,{})">创建人放行出库</button><button onclick="loanAct(`/api/loans/${loanid.value}/confirm`,{})">回执确认结束</button><button onclick="loanAct(`/api/loans/${loanid.value}/retry`,{})">重试回执传输</button></div>
+<div class="row"><label>新保留期限 <input id="retention" type="date"></label><button onclick="loanAct(`/api/evidence/${evid.value}/retention`,{retention_until:retention.value})">更新保留期限并重算提醒</button></div>
+<pre id="loanout"></pre></div>
+
+<pre id="out"></pre>
+<script>
+async function load(){const r=await fetch(`/api/cases/${case.value}/report`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}
+async function loanAct(path,body){const r=await fetch(path,{method:"POST",headers:{"X-User-Id":user.value,"Content-Type":"application/json"},body:JSON.stringify(body)});loanout.textContent=JSON.stringify(await r.json(),null,2)}
+</script></body></html>

@@ -6,9 +6,10 @@ import base64
 import binascii
 import hashlib
 import json
+import os
 import sqlite3
 import threading
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -16,12 +17,21 @@ from urllib.parse import urlparse
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = BASE_DIR / "custody.db"
 MEMBER_ROLES = {"custodian", "analyst", "auditor"}
+# 借调提前提醒天数：提醒日 = 保留期限 - REMIND_DAYS
+LOAN_REMIND_DAYS = 30
+# 借调单状态
+LOAN_STATUSES = ("pending", "out", "closed", "void")
+RECEIPT_STATUSES = ("none", "pending", "confirmed", "failed")
+# 借调相关保管事件类型
+LOAN_EVENT_TYPES = ("LOAN_OUT", "LOAN_RETURN", "LOAN_VOID")
 
 
 class BusinessError(Exception):
-    def __init__(self, message, status=400, code="bad_request"):
+    def __init__(self, message, status=400, code="bad_request", extra=None):
         super().__init__(message)
         self.message, self.status, self.code = message, status, code
+        # 附加冲突信息（如冲突借调单编号），会并入错误响应
+        self.extra = extra or {}
 
 
 def now():
@@ -32,6 +42,9 @@ class CustodyStore:
     def __init__(self, db_path=DEFAULT_DB):
         self.db_path = str(db_path)
         self._lock = threading.Lock()
+        # 回执传输模拟开关：为 True 时回执传输失败，用于演示/测试重试。
+        # 可通过环境变量 CUSTODY_RECEIPT_FAIL=1 开启。
+        self.receipt_fail = os.environ.get("CUSTODY_RECEIPT_FAIL", "0") == "1"
 
     def connect(self):
         conn = sqlite3.connect(self.db_path, timeout=15)
@@ -69,14 +82,48 @@ class CustodyStore:
                     retention_until TEXT NOT NULL, created_by TEXT NOT NULL REFERENCES users(id),
                     created_at TEXT NOT NULL, UNIQUE(case_id,label)
                 );
+                CREATE TABLE IF NOT EXISTS loans(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    loan_no TEXT NOT NULL UNIQUE,
+                    case_id INTEGER NOT NULL REFERENCES cases(id),
+                    evidence_id INTEGER NOT NULL REFERENCES evidence(id),
+                    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','out','closed','void')),
+                    initiator_id TEXT NOT NULL REFERENCES users(id),
+                    approver_id TEXT REFERENCES users(id),
+                    borrower TEXT NOT NULL, purpose TEXT NOT NULL,
+                    out_at TEXT, due_at TEXT, remind_at TEXT,
+                    void_reason TEXT,
+                    receipt_status TEXT NOT NULL DEFAULT 'none' CHECK(receipt_status IN ('none','pending','confirmed','failed')),
+                    receipt_attempts INTEGER NOT NULL DEFAULT 0,
+                    receipt_last_error TEXT,
+                    receipt_transmitted_at TEXT,
+                    receipt_confirmed_at TEXT,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                -- 同一证据同一时刻只允许一条有效（待放行/借出中）借调单
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_loans_one_active
+                    ON loans(evidence_id) WHERE status IN ('pending','out');
+                CREATE TABLE IF NOT EXISTS loan_receipts(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    receipt_no TEXT NOT NULL UNIQUE,
+                    loan_id INTEGER NOT NULL UNIQUE REFERENCES loans(id),
+                    evidence_id INTEGER NOT NULL REFERENCES evidence(id),
+                    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','confirmed','failed')),
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    transmitted_at TEXT,
+                    confirmed_at TEXT,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS custody_events(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     evidence_id INTEGER NOT NULL REFERENCES evidence(id), sequence INTEGER NOT NULL,
-                    event_type TEXT NOT NULL CHECK(event_type IN ('INGEST','TRANSFER','OPEN','ANALYZE','RELEASE','HOLD_SET','HOLD_CLEARED')),
+                    event_type TEXT NOT NULL CHECK(event_type IN ('INGEST','TRANSFER','OPEN','ANALYZE','RELEASE','HOLD_SET','HOLD_CLEARED','LOAN_OUT','LOAN_RETURN','LOAN_VOID')),
                     actor_id TEXT NOT NULL REFERENCES users(id), from_person TEXT,
                     to_person TEXT, location TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '',
                     previous_hash TEXT NOT NULL, event_hash TEXT NOT NULL,
-                    created_at TEXT NOT NULL, UNIQUE(evidence_id,sequence)
+                    created_at TEXT NOT NULL, loan_id INTEGER REFERENCES loans(id),
+                    UNIQUE(evidence_id,sequence)
                 );
                 CREATE TABLE IF NOT EXISTS derivatives(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -92,6 +139,62 @@ class CustodyStore:
                 );
                 """
             )
+            self._migrate_custody_events(conn)
+            self._backfill_legacy_loans(conn)
+
+    def _migrate_custody_events(self, conn):
+        """旧库 custody_events 缺少 loan_id 且事件类型较旧，重建表以纳入借调事件。"""
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='custody_events'"
+        ).fetchone()
+        if not row:
+            return
+        if "loan_id" in (row[0] or "") and "LOAN_OUT" in (row[0] or ""):
+            return  # 已是新结构
+        conn.executescript(
+            """
+            CREATE TABLE custody_events_new(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                evidence_id INTEGER NOT NULL REFERENCES evidence(id), sequence INTEGER NOT NULL,
+                event_type TEXT NOT NULL CHECK(event_type IN ('INGEST','TRANSFER','OPEN','ANALYZE','RELEASE','HOLD_SET','HOLD_CLEARED','LOAN_OUT','LOAN_RETURN','LOAN_VOID')),
+                actor_id TEXT NOT NULL REFERENCES users(id), from_person TEXT,
+                to_person TEXT, location TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '',
+                previous_hash TEXT NOT NULL, event_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL, loan_id INTEGER REFERENCES loans(id),
+                UNIQUE(evidence_id,sequence)
+            );
+            INSERT INTO custody_events_new(id,evidence_id,sequence,event_type,actor_id,from_person,to_person,location,note,previous_hash,event_hash,created_at)
+                SELECT id,evidence_id,sequence,event_type,actor_id,from_person,to_person,location,note,previous_hash,event_hash,created_at FROM custody_events;
+            DROP TABLE custody_events;
+            ALTER TABLE custody_events_new RENAME TO custody_events;
+            """
+        )
+
+    def _backfill_legacy_loans(self, conn):
+        """旧库移交记录（TRANSFER）补借调归属：为每条无归属的历史移交补一条已结束借调单。"""
+        legacy = conn.execute(
+            """SELECT e.id AS event_id, e.evidence_id, e.actor_id, e.from_person, e.to_person,
+                      e.location, e.note, e.created_at
+               FROM custody_events e
+               WHERE e.event_type='TRANSFER' AND e.loan_id IS NULL
+               ORDER BY e.id"""
+        ).fetchall()
+        for ev in legacy:
+            evidence = conn.execute("SELECT case_id, retention_until FROM evidence WHERE id=?", (ev["evidence_id"],)).fetchone()
+            if not evidence:
+                continue
+            ts = ev["created_at"]
+            loan_no = f"LOAN-LEGACY-{ev['event_id']}"
+            cur = conn.execute(
+                """INSERT INTO loans(loan_no,case_id,evidence_id,status,initiator_id,approver_id,borrower,purpose,
+                                     out_at,due_at,remind_at,receipt_status,receipt_transmitted_at,receipt_confirmed_at,
+                                     created_at,updated_at)
+                   VALUES(?,?,?,'closed',?,?,?,?,?,?,?,'confirmed',?,?,?,?)""",
+                (loan_no, evidence["case_id"], ev["evidence_id"], ev["actor_id"], ev["actor_id"],
+                 ev["to_person"] or "", f"旧库移交记录补录：{ev['note'] or '历史移交'}",
+                 ts, evidence["retention_until"], evidence["retention_until"], ts, ts, ts, ts),
+            )
+            conn.execute("UPDATE custody_events SET loan_id=? WHERE id=?", (cur.lastrowid, ev["event_id"]))
 
     def seed(self):
         self.init_schema()
@@ -177,7 +280,7 @@ class CustodyStore:
         canonical = json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(canonical).hexdigest()
 
-    def _append_event(self, conn, evidence_id, event_type, actor, from_person="", to_person="", location="", note=""):
+    def _append_event(self, conn, evidence_id, event_type, actor, from_person="", to_person="", location="", note="", loan_id=None):
         previous = conn.execute(
             "SELECT event_hash,sequence FROM custody_events WHERE evidence_id=? ORDER BY sequence DESC LIMIT 1", (evidence_id,)
         ).fetchone()
@@ -190,9 +293,9 @@ class CustodyStore:
         }
         digest = self._event_hash(payload)
         cur = conn.execute(
-            """INSERT INTO custody_events(evidence_id,sequence,event_type,actor_id,from_person,to_person,location,note,previous_hash,event_hash,created_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-            (evidence_id, sequence, event_type, actor, from_person or None, to_person or None, location, note, previous_hash, digest, payload["created_at"]),
+            """INSERT INTO custody_events(evidence_id,sequence,event_type,actor_id,from_person,to_person,location,note,previous_hash,event_hash,created_at,loan_id)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (evidence_id, sequence, event_type, actor, from_person or None, to_person or None, location, note, previous_hash, digest, payload["created_at"], loan_id),
         )
         return cur.lastrowid, digest
 
@@ -246,6 +349,7 @@ class CustodyStore:
             result["integrity_valid"] = hashlib.sha256(row["content"]).hexdigest() == row["sha256"]
             result["events"] = [dict(x) for x in conn.execute("SELECT * FROM custody_events WHERE evidence_id=? ORDER BY sequence", (evidence_id,)).fetchall()]
             result["derived_children"] = [dict(x) for x in conn.execute("SELECT * FROM derivatives WHERE parent_evidence_id=? ORDER BY id", (evidence_id,)).fetchall()]
+            result["loans"] = self._loans_for_evidence(conn, evidence_id)
             if include_content:
                 result["content_b64"] = base64.b64encode(row["content"]).decode()
             return result
@@ -326,15 +430,26 @@ class CustodyStore:
         if len(reason.strip()) < 5:
             raise BusinessError("法律保留原因至少 5 字", 422, "reason_required")
         with self.connect() as conn:
-            row = self._evidence(conn, evidence_id)
-            case = self._case(conn, row["case_id"])
-            if user_id != case["created_by"]:
-                self._member(conn, row["case_id"], user_id, {"auditor"})
-            conn.execute("UPDATE evidence SET legal_hold=? WHERE id=?", (int(bool(hold)), evidence_id))
-            event = "HOLD_SET" if hold else "HOLD_CLEARED"
-            self._append_event(conn, evidence_id, event, user_id, note=reason.strip())
-            self._audit(conn, row["case_id"], user_id, "evidence.hold", {"evidence_id": evidence_id, "hold": bool(hold), "reason": reason.strip()})
-            return {"id": evidence_id, "legal_hold": bool(hold)}
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = self._evidence(conn, evidence_id)
+                case = self._case(conn, row["case_id"])
+                if user_id != case["created_by"]:
+                    self._member(conn, row["case_id"], user_id, {"auditor"})
+                conn.execute("UPDATE evidence SET legal_hold=? WHERE id=?", (int(bool(hold)), evidence_id))
+                event = "HOLD_SET" if hold else "HOLD_CLEARED"
+                self._append_event(conn, evidence_id, event, user_id, note=reason.strip())
+                if hold:
+                    # 法律保留：待放行单自动失效，借出中的单按保留期限重算提醒
+                    voided = self._void_pending_loans(conn, evidence_id, "法律保留：" + reason.strip(), user_id)
+                    recalculated = self._recalc_loan_reminders(conn, evidence_id)
+                else:
+                    voided, recalculated = [], []
+                self._audit(conn, row["case_id"], user_id, "evidence.hold", {"evidence_id": evidence_id, "hold": bool(hold), "reason": reason.strip(), "voided_loans": voided, "recalculated_loans": recalculated})
+                return {"id": evidence_id, "legal_hold": bool(hold), "voided_loans": voided, "recalculated_loans": recalculated}
+            except Exception:
+                conn.rollback()
+                raise
 
     def release(self, user_id, evidence_id, recipient, note=""):
         if not recipient.strip():
@@ -350,11 +465,286 @@ class CustodyStore:
                     raise BusinessError("证据已经释放", 409, "already_released")
                 self._append_event(conn, evidence_id, "RELEASE", user_id, from_person=row["current_custodian"], to_person=recipient.strip(), note=note.strip())
                 conn.execute("UPDATE evidence SET status='released' WHERE id=?", (evidence_id,))
-                self._audit(conn, row["case_id"], user_id, "evidence.release", {"evidence_id": evidence_id, "recipient": recipient.strip()})
-                return {"id": evidence_id, "status": "released", "recipient": recipient.strip()}
+                # 证据释放：待放行单自动失效，借出中的单按保留期限重算提醒
+                voided = self._void_pending_loans(conn, evidence_id, "证据释放：" + recipient.strip(), user_id)
+                recalculated = self._recalc_loan_reminders(conn, evidence_id)
+                self._audit(conn, row["case_id"], user_id, "evidence.release", {"evidence_id": evidence_id, "recipient": recipient.strip(), "voided_loans": voided, "recalculated_loans": recalculated})
+                return {"id": evidence_id, "status": "released", "recipient": recipient.strip(), "voided_loans": voided, "recalculated_loans": recalculated}
             except Exception:
                 conn.rollback()
                 raise
+
+    # ---------------- 借调单（保管链） ----------------
+
+    def _loan_row(self, conn, loan_id):
+        loan = conn.execute("SELECT * FROM loans WHERE id=?", (loan_id,)).fetchone()
+        if not loan:
+            raise BusinessError("借调单不存在", 404, "loan_not_found")
+        return loan
+
+    def _next_loan_no(self, conn, case_id):
+        seq = conn.execute("SELECT COUNT(*) AS c FROM loans WHERE case_id=?", (case_id,)).fetchone()["c"] + 1
+        return f"LOAN-{case_id}-{seq:04d}"
+
+    def _next_receipt_no(self, conn):
+        seq = conn.execute("SELECT COUNT(*) AS c FROM loan_receipts").fetchone()["c"] + 1
+        return f"RCP-{seq:06d}"
+
+    def _recalc_loan_reminders(self, conn, evidence_id):
+        """借出中的借调单按证据最新保留期限重算应还/提醒日期。"""
+        evidence = conn.execute("SELECT retention_until FROM evidence WHERE id=?", (evidence_id,)).fetchone()
+        if not evidence:
+            return []
+        retention = date.fromisoformat(evidence["retention_until"])
+        due = retention.isoformat()
+        remind = (retention - timedelta(days=LOAN_REMIND_DAYS)).isoformat()
+        rows = conn.execute(
+            "SELECT id, loan_no FROM loans WHERE evidence_id=? AND status='out'", (evidence_id,)
+        ).fetchall()
+        for r in rows:
+            conn.execute(
+                "UPDATE loans SET due_at=?, remind_at=?, updated_at=? WHERE id=?",
+                (due, remind, now(), r["id"]),
+            )
+        return [r["loan_no"] for r in rows]
+
+    def _void_pending_loans(self, conn, evidence_id, reason, actor_id):
+        """待放行借调单自动失效，并追加 LOAN_VOID 保管事件。返回失效借调单编号。"""
+        pending = conn.execute(
+            "SELECT id, loan_no, case_id FROM loans WHERE evidence_id=? AND status='pending'", (evidence_id,)
+        ).fetchall()
+        for loan in pending:
+            conn.execute(
+                "UPDATE loans SET status='void', void_reason=?, updated_at=? WHERE id=?",
+                (reason, now(), loan["id"]),
+            )
+            self._append_event(conn, evidence_id, "LOAN_VOID", actor_id, note=f"借调单 {loan['loan_no']} 自动失效：{reason}", loan_id=loan["id"])
+            self._audit(conn, loan["case_id"], actor_id, "loan.void", {"loan_id": loan["id"], "loan_no": loan["loan_no"], "reason": reason})
+        return [l["loan_no"] for l in pending]
+
+    def _assert_can_manage_loan(self, conn, case, user_id, allow_creator=True):
+        """借调单管理权限：创建人或保管员。"""
+        if allow_creator and case["created_by"] == user_id:
+            return
+        self._member(conn, case["id"], user_id, {"custodian"})
+
+    def initiate_loan(self, user_id, evidence_id, borrower, purpose):
+        if not borrower.strip() or len(purpose.strip()) < 3:
+            raise BusinessError("借调接收人和事由不能为空（事由至少 3 字）", 422, "invalid_loan")
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = self._evidence(conn, evidence_id)
+                case = self._case(conn, row["case_id"])
+                self._member(conn, row["case_id"], user_id, {"custodian"})
+                if row["status"] == "released":
+                    raise BusinessError("证据已释放，不能发起借调", 409, "evidence_released")
+                # 同一证据只允许一条有效借调单
+                active = conn.execute(
+                    "SELECT id, loan_no, status FROM loans WHERE evidence_id=? AND status IN ('pending','out') ORDER BY id LIMIT 1",
+                    (evidence_id,),
+                ).fetchone()
+                if active:
+                    raise BusinessError(
+                        f"该证据已有有效借调单 {active['loan_no']}（{active['status']}），不能重复发起",
+                        409, "loan_conflict",
+                        extra={"conflict_loan_id": active["id"], "conflict_loan_no": active["loan_no"], "conflict_status": active["status"]},
+                    )
+                loan_no = self._next_loan_no(conn, row["case_id"])
+                ts = now()
+                cur = conn.execute(
+                    """INSERT INTO loans(loan_no,case_id,evidence_id,status,initiator_id,borrower,purpose,
+                                         receipt_status,created_at,updated_at)
+                       VALUES(?,?,?,'pending',?,?,?,'none',?,?)""",
+                    (loan_no, row["case_id"], evidence_id, user_id, borrower.strip(), purpose.strip(), ts, ts),
+                )
+                loan_id = cur.lastrowid
+                self._audit(conn, row["case_id"], user_id, "loan.initiate",
+                            {"loan_id": loan_id, "loan_no": loan_no, "evidence_id": evidence_id, "borrower": borrower.strip()})
+                return self._loan_to_dict(conn, conn.execute("SELECT * FROM loans WHERE id=?", (loan_id,)).fetchone())
+            except Exception:
+                conn.rollback()
+                raise
+
+    def approve_loan(self, user_id, loan_id):
+        """创建人放行：待放行 -> 借出中（出库），并生成回执。"""
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                loan = self._loan_row(conn, loan_id)
+                row = self._evidence(conn, loan["evidence_id"])
+                case = self._case(conn, row["case_id"])
+                if case["created_by"] != user_id:
+                    raise BusinessError("只有案件创建人可以放行借调单", 403, "forbidden")
+                if loan["status"] == "out":
+                    # 两人同时放行同一证据：后到者收到冲突编号
+                    raise BusinessError(
+                        f"借调单 {loan['loan_no']} 已放行出库，不能重复放行",
+                        409, "loan_already_approved",
+                        extra={"conflict_loan_id": loan["id"], "conflict_loan_no": loan["loan_no"]},
+                    )
+                if loan["status"] in ("closed", "void"):
+                    raise BusinessError(f"借调单已{('结束' if loan['status']=='closed' else '失效')}，不能放行", 409, "loan_not_pending")
+                if loan["status"] != "pending":
+                    raise BusinessError("借调单当前状态不可放行", 409, "loan_not_pending")
+                # 出库：借出中的单按保留期限重算日程
+                retention = date.fromisoformat(row["retention_until"])
+                ts = now()
+                conn.execute(
+                    """UPDATE loans SET status='out', approver_id=?, out_at=?, due_at=?, remind_at=?,
+                                       receipt_status='pending', updated_at=? WHERE id=?""",
+                    (user_id, ts, retention.isoformat(), (retention - timedelta(days=LOAN_REMIND_DAYS)).isoformat(), ts, loan_id),
+                )
+                self._append_event(conn, loan["evidence_id"], "LOAN_OUT", user_id,
+                                   from_person=row["current_custodian"], to_person=loan["borrower"],
+                                   note=f"借调单 {loan['loan_no']} 放行出库，借调给 {loan['borrower']}", loan_id=loan_id)
+                # 生成回执并尝试传输
+                receipt = self._create_receipt(conn, loan_id, loan["evidence_id"])
+                self._transmit_receipt(conn, receipt)
+                self._audit(conn, row["case_id"], user_id, "loan.approve",
+                            {"loan_id": loan_id, "loan_no": loan["loan_no"], "evidence_id": loan["evidence_id"],
+                             "receipt_no": receipt["receipt_no"]})
+                return self._loan_to_dict(conn, conn.execute("SELECT * FROM loans WHERE id=?", (loan_id,)).fetchone())
+            except Exception:
+                conn.rollback()
+                raise
+
+    def _create_receipt(self, conn, loan_id, evidence_id):
+        existing = conn.execute("SELECT * FROM loan_receipts WHERE loan_id=?", (loan_id,)).fetchone()
+        if existing:
+            return existing
+        receipt_no = self._next_receipt_no(conn)
+        ts = now()
+        cur = conn.execute(
+            """INSERT INTO loan_receipts(receipt_no,loan_id,evidence_id,status,attempts,created_at,updated_at)
+               VALUES(?,?,?,'pending',0,?,?)""",
+            (receipt_no, loan_id, evidence_id, ts, ts),
+        )
+        return conn.execute("SELECT * FROM loan_receipts WHERE id=?", (cur.lastrowid,)).fetchone()
+
+    def _transmit_receipt(self, conn, receipt):
+        """模拟回执传输：成功 -> pending（待确认），失败 -> failed。"""
+        ts = now()
+        attempts = receipt["attempts"] + 1
+        if self.receipt_fail:
+            conn.execute(
+                "UPDATE loan_receipts SET status='failed', attempts=?, last_error=?, transmitted_at=?, updated_at=? WHERE id=?",
+                (attempts, "回执传输失败（模拟）", ts, ts, receipt["id"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE loan_receipts SET status='pending', attempts=?, last_error=NULL, transmitted_at=?, updated_at=? WHERE id=?",
+                (attempts, ts, ts, receipt["id"]),
+            )
+        return conn.execute("SELECT * FROM loan_receipts WHERE id=?", (receipt["id"],)).fetchone()
+
+    def confirm_receipt(self, user_id, loan_id):
+        """回执确认：借出中 -> 已结束（归还），回执已确认。"""
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                loan = self._loan_row(conn, loan_id)
+                row = self._evidence(conn, loan["evidence_id"])
+                case = self._case(conn, row["case_id"])
+                self._assert_can_manage_loan(conn, case, user_id)
+                receipt = conn.execute("SELECT * FROM loan_receipts WHERE loan_id=?", (loan_id,)).fetchone()
+                if loan["status"] == "closed":
+                    # 幂等：已确认结束的借调单不重复出库/事件
+                    return self._loan_to_dict(conn, loan)
+                if loan["status"] != "out":
+                    raise BusinessError("只有借出中的借调单可以确认回执", 409, "loan_not_out")
+                if not receipt:
+                    raise BusinessError("回执不存在", 404, "receipt_not_found")
+                if receipt["status"] == "failed":
+                    raise BusinessError("回执传输失败，请先重试传输", 409, "receipt_failed")
+                if receipt["status"] != "confirmed":
+                    ts = now()
+                    conn.execute(
+                        "UPDATE loan_receipts SET status='confirmed', confirmed_at=?, updated_at=? WHERE id=?",
+                        (ts, ts, receipt["id"]),
+                    )
+                    conn.execute(
+                        "UPDATE loans SET status='closed', receipt_status='confirmed', receipt_confirmed_at=?, updated_at=? WHERE id=?",
+                        (ts, ts, loan_id),
+                    )
+                    self._append_event(conn, loan["evidence_id"], "LOAN_RETURN", user_id,
+                                       from_person=loan["borrower"], to_person=row["current_custodian"],
+                                       note=f"借调单 {loan['loan_no']} 回执确认，证据归还入库", loan_id=loan_id)
+                    self._audit(conn, row["case_id"], user_id, "loan.confirm_receipt",
+                                {"loan_id": loan_id, "loan_no": loan["loan_no"], "receipt_no": receipt["receipt_no"]})
+                return self._loan_to_dict(conn, conn.execute("SELECT * FROM loans WHERE id=?", (loan_id,)).fetchone())
+            except Exception:
+                conn.rollback()
+                raise
+
+    def retry_receipts(self, user_id, case_id, loan_id=None):
+        """重试传输未确认回执；已确认的不重复出库。"""
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                case = self._case(conn, case_id)
+                self._assert_can_manage_loan(conn, case, user_id)
+                sql = """SELECT r.* FROM loan_receipts r
+                         JOIN loans l ON l.id=r.loan_id
+                         WHERE l.case_id=?"""
+                params = [case_id]
+                if loan_id is not None:
+                    sql += " AND r.loan_id=?"
+                    params.append(loan_id)
+                sql += " ORDER BY r.id"
+                receipts = conn.execute(sql, params).fetchall()
+                retried, skipped = [], []
+                for r in receipts:
+                    if r["status"] == "confirmed":
+                        skipped.append(r["receipt_no"])  # 已确认，不重复出库
+                        continue
+                    updated = self._transmit_receipt(conn, r)
+                    retried.append({"receipt_no": r["receipt_no"], "loan_id": r["loan_id"], "status": updated["status"], "attempts": updated["attempts"]})
+                self._audit(conn, case_id, user_id, "loan.retry_receipts",
+                            {"retried": [x["receipt_no"] for x in retried], "skipped_confirmed": skipped})
+                return {"case_id": case_id, "retried": retried, "skipped_confirmed": skipped,
+                        "retried_count": len(retried), "skipped_count": len(skipped)}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def update_retention(self, user_id, evidence_id, retention_until):
+        try:
+            deadline = date.fromisoformat(retention_until)
+        except (ValueError, TypeError):
+            raise BusinessError("保留期限格式错误", 422, "invalid_retention")
+        if deadline < date.today():
+            raise BusinessError("保留期限不能早于今天", 422, "invalid_retention")
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = self._evidence(conn, evidence_id)
+                case = self._case(conn, row["case_id"])
+                self._assert_can_manage_loan(conn, case, user_id)
+                conn.execute("UPDATE evidence SET retention_until=? WHERE id=?", (retention_until, evidence_id))
+                recalculated = self._recalc_loan_reminders(conn, evidence_id)
+                self._audit(conn, row["case_id"], user_id, "evidence.update_retention",
+                            {"evidence_id": evidence_id, "retention_until": retention_until, "recalculated_loans": recalculated})
+                return {"evidence_id": evidence_id, "retention_until": retention_until, "recalculated_loans": recalculated}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def get_loan(self, user_id, loan_id):
+        with self.connect() as conn:
+            loan = self._loan_row(conn, loan_id)
+            self._member(conn, loan["case_id"], user_id)
+            return self._loan_to_dict(conn, loan)
+
+    def _loan_to_dict(self, conn, loan):
+        receipt = conn.execute("SELECT * FROM loan_receipts WHERE loan_id=?", (loan["id"],)).fetchone()
+        out = {k: loan[k] for k in loan.keys()}
+        out["receipt"] = dict(receipt) if receipt else None
+        return out
+
+    def _loans_for_evidence(self, conn, evidence_id):
+        rows = conn.execute("SELECT * FROM loans WHERE evidence_id=? ORDER BY id", (evidence_id,)).fetchall()
+        return [self._loan_to_dict(conn, r) for r in rows]
 
     def report(self, user_id, case_id):
         with self.connect() as conn:
@@ -382,6 +772,7 @@ class CustodyStore:
                     "hash_valid": hash_valid, "chain_valid": chain_valid,
                     "events": [dict(e) for e in events],
                     "derivatives": [dict(x) for x in conn.execute("SELECT * FROM derivatives WHERE parent_evidence_id=? ORDER BY id", (row["id"],)).fetchall()],
+                    "loans": self._loans_for_evidence(conn, row["id"]),
                 })
             audit = conn.execute("SELECT * FROM audit_log WHERE case_id=? ORDER BY id", (case_id,)).fetchall()
             return {
@@ -420,6 +811,21 @@ class Handler(BaseHTTPRequestHandler):
             d=self._body(); return self._send(201,store.ingest_evidence(user,int(parts[2]),d.get("label",""),d.get("filename",""),d.get("content_b64",""),d.get("retention_until",""),d.get("custodian")))
         if len(parts)==4 and parts[:2]==["api","cases"] and parts[3]=="report" and method=="GET":
             return self._send(200,store.report(user,int(parts[2])))
+        if len(parts)==5 and parts[:2]==["api","cases"] and parts[3]=="loans" and parts[4]=="retry" and method=="POST":
+            return self._send(200,store.retry_receipts(user,int(parts[2])))
+        if len(parts)==4 and parts[:2]==["api","evidence"] and parts[3]=="loans" and method=="POST":
+            d=self._body(); return self._send(201,store.initiate_loan(user,int(parts[2]),d.get("borrower",""),d.get("purpose","")))
+        if len(parts)==4 and parts[:2]==["api","evidence"] and parts[3]=="retention" and method=="POST":
+            d=self._body(); return self._send(200,store.update_retention(user,int(parts[2]),d.get("retention_until","")))
+        if len(parts)>=3 and parts[:2]==["api","loans"]:
+            loan_id=int(parts[2])
+            if len(parts)==3 and method=="GET": return self._send(200,store.get_loan(user,loan_id))
+            if len(parts)==4 and method=="POST":
+                if parts[3]=="approve": return self._send(200,store.approve_loan(user,loan_id))
+                if parts[3]=="confirm": return self._send(200,store.confirm_receipt(user,loan_id))
+                if parts[3]=="retry":
+                    loan=store.get_loan(user,loan_id)
+                    return self._send(200,store.retry_receipts(user,loan["case_id"],loan_id))
         if len(parts)>=3 and parts[:2]==["api","evidence"]:
             evidence_id=int(parts[2])
             if len(parts)==3 and method=="GET": return self._send(200,store.get_evidence(user,evidence_id,bool(urlparse(self.path).query)))
@@ -433,7 +839,10 @@ class Handler(BaseHTTPRequestHandler):
         raise BusinessError("接口不存在",404,"not_found")
     def _handle(self, method):
         try: self._dispatch(method)
-        except BusinessError as exc: self._send(exc.status,{"error":{"code":exc.code,"message":exc.message}})
+        except BusinessError as exc:
+            payload={"error":{"code":exc.code,"message":exc.message}}
+            if exc.extra: payload["error"].update(exc.extra)
+            self._send(exc.status,payload)
         except (ValueError,TypeError): self._send(400,{"error":{"code":"invalid_path","message":"路径参数格式错误"}})
         except Exception as exc: self._send(500,{"error":{"code":"internal_error","message":str(exc)}})
     def do_GET(self): self._handle("GET")
